@@ -36,8 +36,8 @@ void Detector::Preprocessing(Mat &img)
 
 Detector::Detector(std::shared_ptr<Classifier> classifier_,
              cv::Size max_window_size_, cv::Size min_window_size_,
-             int kPyramidLevels_, int dx_ = 1, int dy_ = 1,
-             int min_neighbours_ = 3, bool group_rect_ = false)
+             int kPyramidLevels_, int dx_, int dy_,
+             int min_neighbours_, NMS_TYPE nmsType_)
     : classifier(classifier_),
       max_window_size(max_window_size_),
       min_window_size(min_window_size_),
@@ -45,7 +45,7 @@ Detector::Detector(std::shared_ptr<Classifier> classifier_,
       dx(dx_),
       dy(dy_),
       min_neighbours(min_neighbours_),
-      group_rect(group_rect_)
+      nmsType(nmsType_)
 {}
 
 void Detector::CreateImagePyramid(const cv::Mat &img, std::vector<Mat> &pyramid,
@@ -123,13 +123,136 @@ void Detector::Detect(Mat &layer, vector<int> &labels,
             }
         }
     }
-    if (group_rect)
-    {
-        // FIX: groupRectangkes doesn't modificate labels and scores
-        groupRectangles(layerRect, min_neighbours, mergeRectThreshold);
-    }
+    GroupRectangles(rects, labels, scores, mergeRectThreshold);
     rects.insert(rects.end(), layerRect.begin(), layerRect.end());
 }
+
+void Detector::GroupRectangles(std::vector<cv::Rect> &rects,
+    std::vector<int> &labels, std::vector<double> &scores,
+    const double threshold)
+{
+    switch (nmsType)
+    {
+        case NMS_MAX:
+        {
+            GroupRectanglesMax(rects, labels, scores, threshold);
+            break;
+        }
+        case NMS_AVG:
+        {
+            GroupRectanglesAvg(rects, labels, scores, threshold);
+            break;
+        }
+    }    
+}
+
+void Detector::SortRectsByScores(std::vector<cv::Rect> &rects,
+    std::vector<int> &labels, std::vector<double> &scores)
+{
+    for (int i = 0; i < rects.size(); i++)
+    {
+        for (int j = rects.size() - 1; j >= i + 1; j--)
+        {
+            if (scores[j] > scores[j - 1])
+            {
+                double score = scores[j];
+                scores[j] = scores[j - 1];
+                scores[j - 1] = score;
+
+                int label = labels[j];
+                labels[j] = labels[j - 1];
+                labels[j - 1] = label;
+
+                cv::Rect rect = rects[j];
+                rects[j] = rects[j - 1];
+                rects[j - 1] = rect;
+            }
+        }
+    }
+}
+
+void Detector::GroupRectanglesMax(std::vector<cv::Rect> &rects,
+    std::vector<int> &labels, std::vector<double> &scores,
+    const double threshold)
+{
+    SortRectsByScores(rects, labels, scores);
+    for (int i = 0; i < rects.size(); i++)
+    {
+        for (int j = rects.size() - 1; j >= i + 1; j--)
+        {
+            double intersection = (rects[i] & rects[j]).area(),
+                   combination  = rects[i].area() + rects[j].area() - 
+                                  (rects[i] & rects[j]).area();
+            if ( intersection / combination >= threshold)
+            {
+                rects.erase(rects.begin() + j);
+                labels.erase(labels.begin() + j);
+                scores.erase(scores.begin() + j);
+            }
+        }
+    }
+}
+
+cv::Rect Detector::GetAverageRect(const std::vector<cv::Rect> &objRects)
+{
+    int avgWidth = 0, avgHeight = 0;
+    cv::Point2f center(0.0, 0.0);
+    for (int i = 0; i < objRects.size(); i++)
+    {
+        center.x  += objRects[i].x + objRects[i].width  / 2.0;
+        center.y  += objRects[i].y + objRects[i].height / 2.0;
+        avgWidth  += objRects[i].width;
+        avgHeight += objRects[i].height;
+    }
+    center.x  /= objRects.size();
+    center.y  /= objRects.size();
+    avgWidth  /= objRects.size();
+    avgHeight /= objRects.size();
+
+    return cv::Rect((int)(center.x - avgWidth / 2.0), 
+        (int)(center.y - avgHeight / 2.0), (int)avgWidth, (int)avgHeight);
+}
+
+void Detector::GroupRectanglesAvg(std::vector<cv::Rect> &rects,
+    std::vector<int> &labels, std::vector<double> &scores,
+    const double threshold)
+{
+    SortRectsByScores(rects, labels, scores);
+    
+    std::vector<cv::Rect> objRects;
+    std::vector<int> objLabels;
+    std::vector<double> objScores;
+    for (int i = 0; i < rects.size(); i++)
+    {
+        objRects.push_back(rects[i]);
+        objLabels.push_back(labels[i]);
+        objScores.push_back(scores[i]);
+        
+        for (int j = rects.size() - 1; j >= i + 1; j--)
+        {
+            double intersection = (rects[i] & rects[j]).area(),
+                   combination  = rects[i].area() + rects[j].area() - 
+                                  (rects[i] & rects[j]).area();
+            if ( intersection / combination >= threshold)
+            {
+                objRects.push_back(rects[j]);
+                objLabels.push_back(labels[j]);
+                objScores.push_back(scores[j]);
+
+                rects.erase(rects.begin() + j);
+                labels.erase(labels.begin() + j);
+                scores.erase(scores.begin() + j);
+            }
+        }
+        
+        rects[i] = GetAverageRect(objRects);
+        
+        objRects.clear();
+        objLabels.clear();
+        objScores.clear();
+    }
+}
+
 
 #if defined(HAVE_MPI) && defined(PAR_PYRAMID)
 void Detector::GetLayerWindowsNumber(std::vector<cv::Mat> &imgPyramid,
